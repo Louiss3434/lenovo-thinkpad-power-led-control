@@ -7,4 +7,4 @@ Tested on T14 gen2
 
 Try using admin rights if it didnt work the first time
 
-If nothing works, hard reboot by long pressing power button
+If nothing works or something broke, hard reboot by long pressing power button
