@@ -2,41 +2,75 @@
 #include <fstream>
 #include <windows.h>
 #include <string>
-#include <direct.h>     // for _mkdir
-#include <errno.h>      // for errno and EEXIST
+#include <direct.h>     
+#include <errno.h>      
+
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "kernel32.lib")
+
+#define EC_CMD_PORT       0x66
+#define EC_DATA_PORT      0x62
+#define LED_REG           0x0C
+#define EC_CTRLPORT_WRITE 0x81
+
+#define POWER_OFF         0x00
+#define POWER_ON          0x80
+#define MIC_MUTE_OFF      0x0E
 
 typedef void(__stdcall* lpOut32)(short, short);
 typedef short(__stdcall* lpInp32)(short);
 
-#define EC_SC   0x66
-#define EC_DATA 0x62
-#define EC_WRITE_CMD 0x81
+std::string GetInternalPath(const std::string& fileName) {
+    std::string base;
+    char* appData = getenv("APPDATA");
+    
+    if (appData != NULL) {
+        base = std::string(appData) + "\\LedToggle";
+    } else {
+        base = "C:\\LedToggle";
+    }
+    
+    _mkdir(base.c_str());
+    
+    SetFileAttributesA(base.c_str(), FILE_ATTRIBUTE_HIDDEN);
+    
+    return base + "\\" + fileName;
+}
+const std::string STATE_FILE = GetInternalPath("state.bin");
+const std::string LOG_FILE   = GetInternalPath("error.log");
 
-// Use plain strings for paths (compatible with old compilers)
-const std::string STATE_DIR  = std::string(getenv("APPDATA")) + "\\LedToggle";
-const std::string STATE_FILE = STATE_DIR + "\\state.bin";
-const std::string LOG_FILE   = STATE_DIR + "\\error.log";
+void LogError(const std::string& msg) {
+    std::ofstream log(LOG_FILE.c_str(), std::ios::app);
+    if (log.is_open()) {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        log << "[" << st.wYear << "-" << st.wMonth << "-" << st.wDay << " "
+            << st.wHour << ":" << st.wMinute << ":" << st.wSecond 
+            << "] " << msg << std::endl;
+    }
+}
 
-bool WaitEC(lpInp32 gInp32, int retries = 3) {
-    while (retries-- > 0) {
-        int timeout = 300;
-        while ((gInp32(EC_SC) & 0x02) && timeout > 0) {
+bool WaitEC(lpInp32 gInp32) {
+    if (!gInp32) return false;
+    for (int i = 0; i < 3; ++i) {
+        int timeout = 400; 
+        while ((gInp32(EC_CMD_PORT) & 0x02) && --timeout > 0) {
             Sleep(1);
-            --timeout;
         }
         if (timeout > 0) return true;
-        Sleep(10);  // brief backoff
+        Sleep(15); 
     }
     return false;
 }
 
 bool WriteReg(lpOut32 gOut32, lpInp32 gInp32, BYTE addr, BYTE val) {
+    if (!gOut32 || !gInp32) return false;
     if (!WaitEC(gInp32)) return false;
-    gOut32(EC_SC, EC_WRITE_CMD);
+    gOut32(EC_CMD_PORT, EC_CTRLPORT_WRITE);
     if (!WaitEC(gInp32)) return false;
-    gOut32(EC_DATA, addr);
+    gOut32(EC_DATA_PORT, addr);
     if (!WaitEC(gInp32)) return false;
-    gOut32(EC_DATA, val);
+    gOut32(EC_DATA_PORT, val);
     return true;
 }
 
@@ -54,115 +88,78 @@ bool IsElevated() {
     return isElevated != FALSE;
 }
 
-void LogError(const std::string& msg) {
-    std::ofstream log(LOG_FILE.c_str(), std::ios::app);
-    if (log.is_open()) {
-        SYSTEMTIME st;
-        GetLocalTime(&st);
-        log << "[" 
-            << st.wYear << "-" << st.wMonth << "-" << st.wDay << " "
-            << st.wHour << ":" << st.wMinute << ":" << st.wSecond 
-            << "] " << msg << std::endl;
-        log.close();
-    }
-}
-
 int main() {
     if (!IsElevated()) {
-        std::cerr << "This program must be run as Administrator.\n";
+        std::cerr << "Admin privileges required.\n";
         return 1;
     }
 
-    // Create directory if it doesn't exist
-    int dirResult = _mkdir(STATE_DIR.c_str());
-    if (dirResult == 0 || errno == EEXIST) {
-        // Directory created or already exists
-        SetFileAttributesA(STATE_DIR.c_str(), FILE_ATTRIBUTE_HIDDEN);
-    } else {
-        LogError("Failed to create state directory: " + STATE_DIR);
-        std::cerr << "Cannot create state directory.\n";
-        return 1;
-    }
-
-    // Simple mutex to prevent multiple instances
-    HANDLE mutex = CreateMutexA(NULL, TRUE, "Global\\LedToggleSingleInstance");
+    HANDLE mutex = CreateMutexA(NULL, TRUE, "Global\\LedToggle_v4_Fortress");
     if (mutex == NULL || GetLastError() == ERROR_ALREADY_EXISTS) {
-        std::cerr << "Another instance of this program is already running.\n";
         if (mutex) CloseHandle(mutex);
         return 1;
     }
 
-    // Load InpOut DLL from the same directory as the executable
     char exePath[MAX_PATH];
-    GetModuleFileNameA(NULL, exePath, MAX_PATH);
-    
-    std::string exeDir = exePath;
-    size_t lastSlash = exeDir.find_last_of("\\/");
-    if (lastSlash != std::string::npos) {
-        exeDir = exeDir.substr(0, lastSlash);
+    if (GetModuleFileNameA(NULL, exePath, MAX_PATH) == 0) return 1;
+    std::string pathStr(exePath);
+    std::string dllPath = pathStr.substr(0, pathStr.find_last_of("\\/")) + "\\InpOutx64.dll";
+
+    HANDLE hDllFile = CreateFileA(dllPath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hDllFile == INVALID_HANDLE_VALUE) {
+        LogError("Security Alert: DLL missing or locked: " + dllPath);
+        ReleaseMutex(mutex);
+        CloseHandle(mutex);
+        return 1;
     }
-    
-    std::string dllPath = exeDir + "\\InpOutx64.dll";   // change to InpOut32.dll if using 32-bit version
-    
-    HINSTANCE hDll = LoadLibraryA(dllPath.c_str());
+
+    HINSTANCE hDll = LoadLibraryExA(dllPath.c_str(), NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!hDll) {
-        LogError("Failed to load InpOut DLL from: " + dllPath);
-        std::cerr << "Cannot load InpOut DLL. Make sure InpOutx64.dll is in the same folder as this .exe\n";
+        LogError("Failed to load DLL securely.");
+        CloseHandle(hDllFile);
         ReleaseMutex(mutex);
         CloseHandle(mutex);
         return 1;
     }
 
-    lpOut32 gOut32 = (lpOut32)GetProcAddress(hDll, "Out32");
-    lpInp32 gInp32 = (lpInp32)GetProcAddress(hDll, "Inp32");
-    if (!gOut32 || !gInp32) {
-        LogError("Failed to get Out32 or Inp32 function from DLL");
-        std::cerr << "Cannot find Out32/Inp32 functions in DLL.\n";
-        FreeLibrary(hDll);
-        ReleaseMutex(mutex);
-        CloseHandle(mutex);
-        return 1;
+    {
+        lpOut32 gOut32 = (lpOut32)GetProcAddress(hDll, "Out32");
+        lpInp32 gInp32 = (lpInp32)GetProcAddress(hDll, "Inp32");
+
+        if (gOut32 && gInp32) {
+            bool shouldTurnOff = false; 
+            std::ifstream in(STATE_FILE.c_str(), std::ios::binary);
+            if (in.is_open()) {
+                in >> shouldTurnOff;
+                in.close();
+            }
+
+            bool success = true;
+            success &= WriteReg(gOut32, gInp32, LED_REG, MIC_MUTE_OFF);
+
+            if (shouldTurnOff) {
+                success &= WriteReg(gOut32, gInp32, LED_REG, POWER_ON);
+                shouldTurnOff = false;
+            } else {
+                success &= WriteReg(gOut32, gInp32, LED_REG, POWER_OFF);
+                shouldTurnOff = true;
+            }
+
+            if (success) {
+                std::ofstream out(STATE_FILE.c_str(), std::ios::binary | std::ios::trunc);
+                if (out.is_open()) {
+                    out << shouldTurnOff;
+                    out.close();
+                }
+            } else {
+                LogError("Hardware communication failure.");
+            }
+        }
     }
-
-    bool shouldTurnOff = false;  // default: lights are ON
-
-    std::ifstream in(STATE_FILE.c_str(), std::ios::binary);
-    if (in.is_open()) {
-        in >> shouldTurnOff;
-        in.close();
-    }
-
-    bool success = true;
-
-    if (shouldTurnOff) {
-        // Turn lights ON
-        success &= WriteReg(gOut32, gInp32, 0x0C, 0x80);
-        success &= WriteReg(gOut32, gInp32, 0xA0, 0x80);
-        shouldTurnOff = false;
-    } else {
-        // Turn lights OFF
-        success &= WriteReg(gOut32, gInp32, 0x0C, 0x00);
-        success &= WriteReg(gOut32, gInp32, 0xA0, 0x00);
-        shouldTurnOff = true;
-    }
-
-    if (!success) {
-        LogError("EC communication failed (timeout or error)");
-        std::cerr << "Warning: Failed to communicate with Embedded Controller.\n";
-    }
-
-    std::ofstream out(STATE_FILE.c_str(), std::ios::binary | std::ios::trunc);
-    if (out.is_open()) {
-        out << shouldTurnOff;
-        out.close();
-    } else {
-        LogError("Failed to write state file: " + STATE_FILE);
-        std::cerr << "Cannot save LED state.\n";
-    }
-
     FreeLibrary(hDll);
+    CloseHandle(hDllFile);
     ReleaseMutex(mutex);
     CloseHandle(mutex);
-
-    return success ? 0 : 2;
+    
+    return 0;
 }
