@@ -1,5 +1,5 @@
 # lenovo-thinkpad-power-led-control
-Toggle those pesky power button light on off
+Toggle those pesky power button light on off and always turn off mic mute led
 
 Alternative to Winring0
 
